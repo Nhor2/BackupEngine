@@ -21,6 +21,9 @@ Public Class BackupEngine
     ' VSS - Shadow Copy
     Public Property UseVss As Boolean = False
 
+    ' Full Verbose
+    Public Property FullVerbose As Boolean = False
+
 
     <DllImport("kernel32.dll", SetLastError:=True, CharSet:=CharSet.Unicode)>
     Public Shared Function CopyFile(lpExistingFileName As String, lpNewFileName As String, bFailIfExists As Boolean) As Boolean
@@ -116,104 +119,78 @@ Public Class BackupEngine
     End Function
 
 
-
     Public Sub BackupSimulation(sourceDir As String, destDir As String, totalFiles As Integer, ByRef filesCopied As Integer)
         ' Simulazione senza copia
 
+        ' Al posto del controllo esistenza 
+        Dim createdDirs As New HashSet(Of String)
+        Dim createdFiles As New HashSet(Of String)
+
         ' Crea la directory corrente
         RaiseEvent OnMessage("[DRY]: Creo Destinazione: " & destDir)
+        RaiseEvent OnMessage("[DEBUG] ENTER BackupSimulation " & DateTime.Now.ToString("HH:mm:ss.fff"))
 
-        For Each file As String In Directory.GetFiles(sourceDir)
-
-            ' Skip file temporanei, downloads parziali etc. Il tempo non aspetta :D
-            If ShouldSkipFile(file) Then
-                RaiseEvent OnMessage(vbCrLf & "[DRY} SKIP TEMP: " & file)
-                Continue For
-            End If
+        For Each file As String In Directory.EnumerateFiles(sourceDir, "*.*", SearchOption.AllDirectories)
 
             ' Controllo file esistenza (NO long path qui)
-            Dim sourcePath As String = "\\?\" & Path.GetFullPath(file)
-
-            ' Long path origine
-            Dim longPathOrigin As String = sourcePath
+            Dim sourcePath As String = Path.GetFullPath(file)
+            Dim normalizedSource As String = NormalizePath(Path.GetFullPath(sourcePath))
 
             ' Percorso relativo
             Dim relativePath As String = GetRelativePath(sourceDir, file)
 
             ' Destinazione
             Dim targetFile As String = Path.Combine(destDir, relativePath)
+            Dim destPath As String = Path.GetFullPath(targetFile)
+            Dim normalizedDest As String = NormalizePath(Path.GetFullPath(destPath))
+            Dim tempPath As String = normalizedDest & ".partial"
+            Dim normalizedTemp As String = NormalizePath(Path.GetFullPath(tempPath))
+
             Dim targetDirOnly As String = Path.GetDirectoryName(targetFile)
-
-            ' Long path destinazione
-            Dim useLongPath As Boolean = (file.Length > 240 OrElse targetFile.Length > 240)
-
-            Dim destPath As String = "\\?\" & Path.GetFullPath(targetFile)
-
-            RaiseEvent OnMessage(vbCrLf & "[DRY] Creazione Cartella: " & targetDirOnly)
+            If Not createdDirs.Contains(targetDirOnly) Then
+                createdDirs.Add(targetDirOnly)
+                RaiseEvent OnMessage("[DRY] Creazione Cartella: " & targetDirOnly)
+            End If
 
             ' Size sicura
             Dim size As Long = 0
-            Try
-                size = SafeGetFileSize(sourcePath)
-                If size = 0 Then
-                    RaiseEvent OnMessage(vbCrLf & "[DRY] ZERO byte [" & size.ToString() & "] per " & file)
-                End If
-            Catch
-                RaiseEvent OnMessage(vbCrLf & "[DRY} Errore Size: " & file)
-            End Try
+            size = SafeGetFileSize(sourcePath)
+            If size = 0 Then
+                If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] ZERO byte [" & size.ToString() & "] per " & file)
+            End If
 
             ' Debug path lunghi
             If file.Length > 250 Then
-                RaiseEvent OnMessage(vbCrLf & "[DRY] PATH > 250 → " & file)
+                If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] PATH > 250 → " & file)
             End If
 
             Dim copied As Boolean = False
-            Dim normalizedDest As String = Path.GetFullPath(destPath)
-
-            Dim tempPath As String = normalizedDest & ".partial"
-            Dim normalizedSource As String = Path.GetFullPath(sourcePath)
-            Dim normalizedTemp As String = Path.GetFullPath(tempPath)
-
-            ' Assicurati che la cartella destinazione esista
-            Dim destDirOnly As String = Path.GetDirectoryName(destPath)
-            RaiseEvent OnMessage(vbCrLf & "[DRY] Creazione cartella " & destDirOnly)
 
             ' Copia Simulata
-            RaiseEvent OnMessage(vbCrLf & "[DRY] COPIED tmp: " & normalizedTemp)
-            copied = True
+            If Not createdFiles.Contains(normalizedDest) Then
+                createdFiles.Add(normalizedDest)
 
-            ' Rinomina atomica
-            If copied Then
-                RaiseEvent OnMessage(vbCrLf & "[DRY] MOVE atomico: " & normalizedDest)
+                If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] COPIED tmp: " & normalizedTemp)
+                If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] MOVE atomico: " & normalizedDest)
+
+                copied = True
             End If
 
-            Dim attrs = System.IO.File.GetAttributes(sourcePath)
-            RaiseEvent OnMessage(vbCrLf & "[DRY] Attributi: " & file)
-            RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & file)
-
+            Dim attrs = System.IO.File.GetAttributes(normalizedSource)
             ' Date
-            Try
-                RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & System.IO.File.GetCreationTime(sourcePath) & " " & destPath)
-                RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & System.IO.File.GetLastWriteTime(sourcePath) & " " & destPath)
-                RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & System.IO.File.GetLastAccessTime(sourcePath) & " " & destPath)
-            Catch
-                RaiseEvent OnMessage(vbCrLf & "[DRY] ERRORE date: " & targetFile)
-            End Try
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & System.IO.File.GetCreationTime(normalizedSource) & " " & destPath)
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & System.IO.File.GetLastWriteTime(normalizedSource) & " " & destPath)
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] SET Attributi: " & System.IO.File.GetLastAccessTime(normalizedSource) & " " & destPath)
 
             Dim zoneIdentifier As String = destPath & ":Zone.Identifier"
-            RaiseEvent OnMessage(vbCrLf & "[DRY] ZoneIdentifier: " & zoneIdentifier)
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] ZoneIdentifier: " & zoneIdentifier)
 
             ' Attrtibuti Speciali
-            Dim attrsExtended As FileAttributes = 0
-            Try
-                attrsExtended = System.IO.File.GetAttributes(sourcePath)
-            Catch
-                attrsExtended = 0
-            End Try
+            Dim attrsExtended = System.IO.File.GetAttributes(normalizedSource)
             ' Compressione
-            RaiseEvent OnMessage(vbCrLf & "[DRY] SET Flag Compresso: " & destPath)
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] SET Flag Compresso: " & destPath)
             ' Cifratura
-            RaiseEvent OnMessage(vbCrLf & "[DRY] SET Flag Encrypted: " & destPath)
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[DRY] SET Flag Encrypted: " & destPath & vbCrLf)
 
             ' =========================
             ' PROGRESS
@@ -228,24 +205,8 @@ Public Class BackupEngine
                 Dim percent As Double = (filesCopied / totalFiles) * 100
                 RaiseEvent OnMessage(String.Format(Environment.NewLine & "[DRY] COPYING >>>> {0} / {1} ({2:0.00}%)" & vbCrLf, filesCopied, totalFiles, percent))
             End If
-
-            For Each dir As String In Directory.GetDirectories(sourceDir)
-                Try
-                    Dim dirName As String = Path.GetFileName(dir)
-                    Dim targetDir As String = Path.Combine(destDir, dirName)
-
-                    BackupSimulation(dir, targetDir, totalFiles, filesCopied)
-
-                Catch ex As UnauthorizedAccessException
-                    RaiseEvent OnMessage(vbCrLf & "[DRY] ERRORE Accesso negato DIR: " & dir)
-                Catch ex As Exception
-                    RaiseEvent OnMessage(vbCrLf & "[DRY] ERRORE DIR: " & dir & " - " & ex.Message)
-                End Try
-            Next
-
         Next
     End Sub
-
 
 
     Public Sub CopyDirectoryWithDatesSafe(sourceDir As String, destDir As String, totalFiles As Integer, ByRef filesCopied As Integer)
@@ -473,9 +434,9 @@ Public Class BackupEngine
                     ' DATE
                     ' =========================
                     Try
-                        System.IO.File.SetCreationTime(destPath, System.IO.File.GetCreationTime(sourcePath))
-                        System.IO.File.SetLastWriteTime(destPath, System.IO.File.GetLastWriteTime(sourcePath))
-                        System.IO.File.SetLastAccessTime(destPath, System.IO.File.GetLastAccessTime(sourcePath))
+                        System.IO.File.SetCreationTime(destPath, System.IO.File.GetCreationTime(normalizedSource))
+                        System.IO.File.SetLastWriteTime(destPath, System.IO.File.GetLastWriteTime(normalizedSource))
+                        System.IO.File.SetLastAccessTime(destPath, System.IO.File.GetLastAccessTime(normalizedSource))
                     Catch
                         RaiseEvent OnMessage(vbCrLf & "ERRORE date: " & targetFile)
                     End Try
@@ -494,7 +455,7 @@ Public Class BackupEngine
                     ' =========================
                     Dim attrsExtended As FileAttributes = 0
                     Try
-                        attrsExtended = System.IO.File.GetAttributes(sourcePath)
+                        attrsExtended = System.IO.File.GetAttributes(normalizedSource)
                     Catch
                         attrsExtended = 0
                     End Try
