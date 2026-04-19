@@ -1,0 +1,37 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Users\\lordm\\source\\repos2\\BackupEngineLib\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{C26A2F70-39B0-42F6-B935-C56BD78813EB}|BackupEngineLib.vbproj|c:\\users\\lordm\\source\\repos2\\backupenginelib\\backupenginelib.vb||{2C015C70-C72C-11D0-88C3-00A0C9110049}",
+      "RelativeMoniker": "D:0:0:{C26A2F70-39B0-42F6-B935-C56BD78813EB}|BackupEngineLib.vbproj|solutionrelative:backupenginelib.vb||{2C015C70-C72C-11D0-88C3-00A0C9110049}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 0,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "BackupEngineLib.vb",
+              "DocumentMoniker": "C:\\Users\\lordm\\source\\repos2\\BackupEngineLib\\BackupEngineLib.vb",
+              "RelativeDocumentMoniker": "BackupEngineLib.vb",
+              "ToolTip": "C:\\Users\\lordm\\source\\repos2\\BackupEngineLib\\BackupEngineLib.vb",
+              "RelativeToolTip": "BackupEngineLib.vb",
+              "ViewState": "AgIAANIAAAAAAAAAAAAkwNwAAAAcAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.003361|",
+              "WhenOpened": "2026-04-09T15:02:14.5Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
