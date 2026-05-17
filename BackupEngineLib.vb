@@ -24,6 +24,9 @@ Public Class BackupEngine
     ' Full Verbose
     Public Property FullVerbose As Boolean = False
 
+    ' notifica alla form
+    Public Event OnYieldRequired()
+
 
     <DllImport("kernel32.dll", SetLastError:=True, CharSet:=CharSet.Unicode)>
     Public Shared Function CopyFile(lpExistingFileName As String, lpNewFileName As String, bFailIfExists As Boolean) As Boolean
@@ -70,21 +73,47 @@ Public Class BackupEngine
         Return manifestPath
     End Function
 
-    Private Function SafeGetFileSize(path As String) As Long
+    Public Function SafeGetFileSize(path As String) As Long
+        If String.IsNullOrWhiteSpace(path) Then Return -1
+
         Try
-            ' Tentativo normale
-            Return New FileInfo(path).Length
+            Using fs As New FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+                Return fs.Length
+            End Using
+        Catch ex As FileNotFoundException
+            Return -2
+        Catch ex As DirectoryNotFoundException
+            Return -2
         Catch
+            ' fallback long path
             Try
-                ' Fallback long path
-                Dim lp = "\\?\" & System.IO.Path.GetFullPath(path)
+                Dim lp = ToLongPath(path)
+
                 Using fs As New FileStream(lp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
                     Return fs.Length
                 End Using
+            Catch ex2 As FileNotFoundException
+                Return -2
+            Catch ex2 As DirectoryNotFoundException
+                Return -2
             Catch
-                Return -1 ' errore
+                Return -1
             End Try
         End Try
+    End Function
+
+    Public Function ToLongPath(path As String) As String
+        If String.IsNullOrWhiteSpace(path) Then Return path
+
+        If path.StartsWith("\\?\") Then Return path
+
+        If path.StartsWith("\\") Then
+            ' UNC → \\?\UNC\server\share
+            Return "\\?\UNC\" & path.Substring(2)
+        Else
+            ' Normale → \\?\C:\...
+            Return "\\?\" & path
+        End If
     End Function
 
 
@@ -209,7 +238,87 @@ Public Class BackupEngine
     End Sub
 
 
+    Public Function SafeCopy(source As String, dest As String, Optional logging As Boolean = False) As Boolean
+        ' Semplice copia con Fallback per evitare problemi di file lock o accesso negato, soprattutto su file in uso
+        Dim returned As Boolean = False
+        Dim copied As Boolean = False
+
+        For i = 1 To 3
+            Try
+                'OK
+                System.IO.File.Copy(source, dest, True)
+                If logging Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+                returned = True
+                copied = True
+            Catch
+                ' Riprovo
+                System.Threading.Thread.Sleep(200)
+            End Try
+        Next
+
+        ' 🔁 FALLBACK SICURO
+        If copied Then Return True
+
+        Try
+            Dim tempDest = dest & ".tmp"
+
+            Using sourceStream As New FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read)
+                Using destStream As New FileStream(tempDest, FileMode.Create, FileAccess.Write, FileShare.None)
+                    sourceStream.CopyTo(destStream)
+                End Using
+            End Using
+
+            ' Sostituzione atomica
+            If System.IO.File.Exists(dest) Then System.IO.File.Delete(dest)
+            System.IO.File.Move(tempDest, dest)
+            If logging Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+
+            returned = True
+
+        Catch
+            RaiseEvent OnMessage(vbCrLf & $"[ERROR] File non copiato: {source}")
+            returned = False
+        End Try
+
+        Return returned
+    End Function
+
+
+    Public Sub SecureDelete(filePath As String, Optional chunkBuffer As Integer = 4096)
+        ' Cancella un file in modo sicuro
+        If Not System.IO.File.Exists(filePath) Then Return
+
+        Dim length = New System.IO.FileInfo(filePath).Length
+
+        ' Sovrascrittura
+        Using fs As New System.IO.FileStream(filePath, System.IO.FileMode.Open, System.IO.FileAccess.Write)
+
+            Dim buffer(chunkBuffer - 1) As Byte
+            Dim rng As New System.Security.Cryptography.RNGCryptoServiceProvider()
+
+            Dim written As Long = 0
+
+            While written < length
+
+                rng.GetBytes(buffer)
+
+                Dim toWrite = Math.Min(buffer.Length, length - written)
+
+                fs.Write(buffer, 0, toWrite)
+
+                written += toWrite
+
+            End While
+
+        End Using
+
+        ' Rimozione
+        System.IO.File.Delete(filePath)
+    End Sub
+
+
     Public Sub CopyDirectoryWithDatesSafe(sourceDir As String, destDir As String, totalFiles As Integer, ByRef filesCopied As Integer)
+        ' Funzione di copia ricorsiva evoluta
         Try
             ' Crea la directory corrente
             If Not Directory.Exists(destDir) Then
@@ -337,16 +446,40 @@ Public Class BackupEngine
                     If Not Directory.Exists(destDirOnly) Then Directory.CreateDirectory(destDirOnly)
 
                     ' =========================
-                    ' RETRY COPYFILEW
+                    ' RETRY COPYFILEW - RESILIENT VERSION
                     ' =========================
-                    For i As Integer = 1 To 3
+                    Dim maxRetries As Integer = 10 ' Almeno 10 tentativi per la rete
+                    Dim retryDelay As Integer = 2000 ' 2 secondi tra i tentativi (dà tempo alla rete di riprendersi)
+
+                    For i As Integer = 1 To maxRetries
                         If BackupEngine.CopyFileWin32(normalizedSource, normalizedTemp, False) Then
                             copied = True
                             Exit For
                         Else
                             Dim err = Marshal.GetLastWin32Error()
-                            RaiseEvent OnMessage(vbCrLf & "ERRORE CopyFile API: " & err & " -> " & file)
-                            Threading.Thread.Sleep(50)
+
+                            ' 53: Network path not found
+                            ' 64: Network name is no longer available
+                            ' 121: Semaphore timeout period has expired (tipico dei grossi file su WiFi instabile)
+                            ' 5: Access Denied (magari Samba si è riavviato e sta rinegoziando i permessi)
+
+                            RaiseEvent OnMessage($"[TENTATIVO {i}] Errore API {err} su: {Path.GetFileName(file)}")
+
+                            If i < maxRetries Then
+                                ' Se è un errore di rete, forse è meglio aspettare un po' di più
+                                If err = 64 Or err = 53 Or err = 121 Then
+                                    RaiseEvent OnMessage("Rete instabile, attesa riconnessione...")
+
+                                    ' Notifica alla Form che deve processare i messaggi
+                                    RaiseEvent OnYieldRequired()
+
+                                    Threading.Thread.Sleep(5000) ' Aspetta 5 secondi se la rete è proprio giù
+                                Else
+                                    Threading.Thread.Sleep(retryDelay) ' Aspetta 2 secondi per errori generici
+                                End If
+                            Else
+                                RaiseEvent OnMessage("ERRORE DEFINITIVO dopo " & maxRetries & " tentativi.")
+                            End If
                         End If
                     Next
 
@@ -526,6 +659,33 @@ Public Class BackupEngine
     End Sub
 
 
+    Private Async Function ExecuteWithRetry(action As Action, Optional maxRetries As Integer = 5) As Task(Of Boolean)
+        Dim retryCount As Integer = 0
+        Dim delaySeconds As Integer = 5 ' Aspetta 5 secondi tra i tentativi
+
+        While retryCount < maxRetries
+            Try
+                action.Invoke()
+                Return True ' Successo!
+            Catch ex As IOException
+                retryCount += 1
+                RaiseEvent OnMessage($"[RETE] Connessione persa. Tentativo {retryCount}/{maxRetries} in corso...")
+
+                ' Aspettiamo prima di riprovare
+                Task.Delay(delaySeconds * 1000)
+
+                ' Opzionale: raddoppia il tempo di attesa ad ogni errore (Exponential Backoff)
+                delaySeconds *= 2
+            Catch ex As Exception
+                RaiseEvent OnMessage("[ERRORE FATALE] " & ex.Message)
+                Return False
+            End Try
+        End While
+
+        Return False ' Timeout raggiunto
+    End Function
+
+
     Private Function IsNtfs(path As String) As Boolean
         Try
             Dim root = System.IO.Path.GetPathRoot(path)
@@ -558,14 +718,56 @@ Public Class BackupEngine
     End Function
 
 
-    Private Function NormalizePath(path As String) As String
-        Dim full = System.IO.Path.GetFullPath(path)
+    Public Function NormalizePath(input As String) As String
+        If String.IsNullOrWhiteSpace(input) Then Return ""
 
-        If Not full.StartsWith("\\?\") Then
-            Return "\\?\" & full
+        ' 1. Pulizia spazi e conversione slash stile Linux
+        Dim path As String = input.Trim().Replace("/"c, "\"c)
+        Try
+            path = System.IO.Path.GetFullPath(path)
+        Catch
+            Return input
+        End Try
+
+        ' 2. PROTEZIONE UNC: Se inizia con \\, identifichiamo se è rete o percorso esteso
+        If path.StartsWith("\\") Then
+            ' Se è già un percorso esteso (\\?\), restituiscilo intatto
+            If path.StartsWith("\\?\") Then Return path
+
+            ' Se è un percorso UNC standard (\\server\share), 
+            ' assicuriamoci di non "mangiare" i due backslash iniziali
+            ' e procediamo con cautela
         End If
 
-        Return full
+        ' 3. Formattazione lettera unità (solo per percorsi locali tipo c:\)
+        ' Usiamo un controllo più stringente per non colpire i percorsi di rete
+        If path.Length >= 2 AndAlso path(1) = ":"c AndAlso Not path.StartsWith("\\") Then
+            path = Char.ToUpper(path(0)) & path.Substring(1)
+        End If
+
+        ' 4. Rimozione slash finale (Trailing Slash)
+        ' Per i percorsi UNC tipo \\172.29.132.121\backup_test\, 
+        ' dobbiamo assicurarci di non ridurlo a \\172.29.132.121 (che non è una cartella valida)
+        If path.EndsWith("\") Then
+            ' Se è una root locale (C:\) o una share di rete (\\server\share), NON rimuovere lo slash
+            If Not IsRootFolder(path) Then
+                path = path.TrimEnd("\"c)
+            End If
+        End If
+
+        Return path
+    End Function
+
+    Public Function IsRootFolder(path As String) As Boolean
+        ' Funzione di supporto per capire se siamo sulla radice
+        ' Caso locale: C:\
+        If path.Length <= 3 AndAlso path.EndsWith(":\") Then Return True
+
+        ' Caso UNC: \\server\share\
+        Dim parts = Strings.Split(path, "\"c, StringSplitOptions.RemoveEmptyEntries)
+        If path.StartsWith("\\") AndAlso parts.Length <= 2 Then Return True
+
+        Return False
     End Function
 
     Public Sub CreateBackupManifest(sourceDir As String, destDir As String, manifestPath As String)
@@ -600,6 +802,7 @@ Public Class BackupEngine
         manifest.TotalFiles = totalFiles
 
         Dim totalSize As Long = 0
+        Dim runningTotalFiles As Long = 0
 
         For Each file In Directory.EnumerateFiles(sourceDir, "*.*", SearchOption.AllDirectories)
 
@@ -618,10 +821,13 @@ Public Class BackupEngine
                     Continue For
                 End If
 
-                Dim size As Long
+                Dim currentFileSize As Long
                 Using fs = New FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
-                    size = fs.Length
+                    currentFileSize = fs.Length
                 End Using
+
+                totalSize += currentFileSize
+                runningTotalFiles += 1
 
                 Dim creation = System.IO.File.GetCreationTime(path)
                 Dim write = System.IO.File.GetLastWriteTime(path)
@@ -642,7 +848,7 @@ Public Class BackupEngine
                 manifest.FileList.Add(New FileInfoEntry With {
             .RelativePath = GetRelativePath(sourceDir, file),
             .FileName = System.IO.Path.GetFileName(file),
-            .SizeBytes = size,
+            .SizeBytes = currentFileSize,
             .CreationTime = creation,
             .LastWriteTime = write,
             .LastAccessTime = access,
@@ -659,6 +865,13 @@ Public Class BackupEngine
         Next
 
         manifest.TotalSizeBytes = totalSize
+
+        If totalFiles <> runningTotalFiles Then
+            Debug.WriteLine("WARNING: Totale file non congruo. Expected: " & totalFiles & ", Actual: " & runningTotalFiles)
+            If runningTotalFiles > totalFiles Then
+                manifest.TotalFiles = runningTotalFiles ' correzione
+            End If
+        End If
 
         ' Scrivi manifest in JSON
         Dim options As New JsonSerializerOptions() With {
@@ -927,12 +1140,15 @@ Public Class BackupEngine
                 Dim sizeSrc = SafeGetFileSize(sourceFile)
                 Dim sizeDst = SafeGetFileSize(destFile)
 
-                If sizeSrc <> sizeDst Then
-                    RaiseEvent OnMessage("SIZE MISMATCH: " & destFile)
-                    failed += 1
-                Else
-                    RaiseEvent OnMessage("OK: " & destFile)
+                If sizeSrc <> -1 OrElse sizeSrc <> -2 Then 'Errori -1 FilenotFound -2 DirectoryNotFound
+                    If sizeSrc <> sizeDst Then
+                        RaiseEvent OnMessage("SIZE MISMATCH: " & destFile)
+                        failed += 1
+                    Else
+                        RaiseEvent OnMessage("OK: " & destFile)
+                    End If
                 End If
+
 
                 '=========================
                 ' ATTRIBUTI NTFS
