@@ -27,6 +27,10 @@ Public Class BackupEngine
     ' notifica alla form
     Public Event OnYieldRequired()
 
+    ' Skipping aggregato
+    Public SkippingFile As Long = 0
+    Public SkippingError As Long = 0
+
 
     <DllImport("kernel32.dll", SetLastError:=True, CharSet:=CharSet.Unicode)>
     Public Shared Function CopyFile(lpExistingFileName As String, lpNewFileName As String, bFailIfExists As Boolean) As Boolean
@@ -242,12 +246,13 @@ Public Class BackupEngine
         ' Semplice copia con Fallback per evitare problemi di file lock o accesso negato, soprattutto su file in uso
         Dim returned As Boolean = False
         Dim copied As Boolean = False
+        SkippingError = 0
 
         For i = 1 To 3
             Try
                 'OK
                 System.IO.File.Copy(source, dest, True)
-                If logging Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+                If logging OrElse FullVerbose Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
                 returned = True
                 copied = True
             Catch
@@ -271,11 +276,12 @@ Public Class BackupEngine
             ' Sostituzione atomica
             If System.IO.File.Exists(dest) Then System.IO.File.Delete(dest)
             System.IO.File.Move(tempDest, dest)
-            If logging Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+            If logging OrElse FullVerbose Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
 
             returned = True
 
         Catch
+            SkippingError += 1
             RaiseEvent OnMessage(vbCrLf & $"[ERROR] File non copiato: {source}")
             returned = False
         End Try
@@ -319,6 +325,10 @@ Public Class BackupEngine
 
     Public Sub CopyDirectoryWithDatesSafe(sourceDir As String, destDir As String, totalFiles As Integer, ByRef filesCopied As Integer)
         ' Funzione di copia ricorsiva evoluta
+        Dim completedSuccessfully As Boolean = False
+        SkippingError = 0
+        SkippingFile = 0
+
         Try
             ' Crea la directory corrente
             If Not Directory.Exists(destDir) Then
@@ -332,7 +342,14 @@ Public Class BackupEngine
 
                 ' Skip file temporanei, downloads parziali etc. Il tempo non aspetta :D
                 If ShouldSkipFile(file) Then
-                    RaiseEvent OnMessage("SKIP TEMP: " & file)
+                    SkippingFile += 1
+
+                    If FullVerbose Then
+                        If SkippingFile Mod 100 = 0 Then
+                            RaiseEvent OnMessage($"SKIP TEMP: {SkippingFile} file...")
+                        End If
+                    End If
+
                     Continue For
                 End If
 
@@ -359,6 +376,7 @@ Public Class BackupEngine
                     End If
 
                     If Not exists Then
+                        SkippingError += 1
                         RaiseEvent OnMessage(vbCrLf & "File sparito: " & file)
                         Continue For
                     End If
@@ -395,8 +413,13 @@ Public Class BackupEngine
 
                             ' confronto base (veloce e sufficiente per 90% casi)
                             If srcInfo.Length = dstInfo.Length AndAlso srcInfo.LastWriteTime <= dstInfo.LastWriteTime Then
+                                SkippingFile += 1
 
-                                RaiseEvent OnMessage("SKIP (già presente): " & file)
+                                If FullVerbose Then
+                                    If SkippingFile Mod 100 = 0 Then
+                                        RaiseEvent OnMessage($"SKIP: {SkippingFile} file " & file)
+                                    End If
+                                End If
 
                                 filesCopied += 1
                                 If totalFiles > 0 Then
@@ -409,7 +432,8 @@ Public Class BackupEngine
 
                         End If
                     Catch ex As Exception
-                        RaiseEvent OnMessage("SKIP CHECK ERROR: " & file)
+                        SkippingError += 1
+                        If FullVerbose Then RaiseEvent OnMessage("SKIP CHECK ERROR: " & file)
                     End Try
 
                     ' =========================
@@ -422,7 +446,7 @@ Public Class BackupEngine
                             RaiseEvent OnMessage(vbCrLf & "ZERO byte [" & size.ToString() & "] per " & file)
                         End If
                     Catch
-                        RaiseEvent OnMessage(vbCrLf & "Errore Size: " & file)
+                        If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "Errore Size: " & file)
                     End Try
 
                     ' Debug path lunghi
@@ -478,6 +502,7 @@ Public Class BackupEngine
                                     Threading.Thread.Sleep(retryDelay) ' Aspetta 2 secondi per errori generici
                                 End If
                             Else
+                                SkippingError += 1
                                 RaiseEvent OnMessage("ERRORE DEFINITIVO dopo " & maxRetries & " tentativi.")
                             End If
                         End If
@@ -499,6 +524,7 @@ Public Class BackupEngine
                             copied = True
                             RaiseEvent OnMessage(vbCrLf & "COPY FALLBACK FileStream OK -> " & file)
                         Catch ex As Exception
+                            SkippingError += 1
                             RaiseEvent OnMessage(vbCrLf & "ERRORE FALLBACK FileStream: " & ex.Message & " -> " & file)
                         End Try
                     End If
@@ -514,13 +540,15 @@ Public Class BackupEngine
                             If Not System.IO.File.Exists(normalizedTemp) Then
                                 RaiseEvent OnMessage("❌ TEMP MISSING -> " & normalizedTemp)
                                 copied = False
+
                                 Exit Try
                             End If
 
                             System.IO.File.Move(normalizedTemp, normalizedDest)
 
-                            RaiseEvent OnMessage("COPIED -> " & normalizedDest)
+                            If FullVerbose Then RaiseEvent OnMessage("COPIED -> " & normalizedDest)
                         Catch ex As Exception
+                            SkippingError += 1
                             RaiseEvent OnMessage("ERRORE RENAME: " & ex.Message & " -> " & file)
                             copied = False
                         End Try
@@ -530,6 +558,7 @@ Public Class BackupEngine
                     ' Se ancora non copiato, segnala
                     ' =========================
                     If Not copied Then
+                        SkippingError += 1
                         RaiseEvent OnMessage(vbCrLf & "ERRORE COPIA DEFINITIVO: " & file)
                         Continue For
                     End If
@@ -542,6 +571,7 @@ Public Class BackupEngine
                     Try
                         attrs = System.IO.File.GetAttributes(sourcePath)
                     Catch
+                        SkippingError += 1
                         RaiseEvent OnMessage(vbCrLf & "ERRORE attributi: " & file)
                         Continue For
                     End Try
@@ -560,6 +590,7 @@ Public Class BackupEngine
                             System.IO.File.Delete(zoneIdentifier)
                         End If
                     Catch
+                        SkippingError += 1
                         RaiseEvent OnMessage(vbCrLf & "ERRORE Impossibile rimuovere Zone.Identifier: " & targetFile)
                     End Try
 
@@ -571,6 +602,7 @@ Public Class BackupEngine
                         System.IO.File.SetLastWriteTime(destPath, System.IO.File.GetLastWriteTime(normalizedSource))
                         System.IO.File.SetLastAccessTime(destPath, System.IO.File.GetLastAccessTime(normalizedSource))
                     Catch
+                        SkippingError += 1
                         RaiseEvent OnMessage(vbCrLf & "ERRORE date: " & targetFile)
                     End Try
 
@@ -580,6 +612,7 @@ Public Class BackupEngine
                     Try
                         System.IO.File.SetAttributes(destPath, attrs)
                     Catch
+                        SkippingError += 1
                         RaiseEvent OnMessage(vbCrLf & "ERRORE set attributi: " & targetFile)
                     End Try
 
@@ -598,8 +631,11 @@ Public Class BackupEngine
                             BackupEngine.SetCompressed(destPath, True)
                         End If
                     Catch ex As Exception
-                        RaiseEvent OnMessage(vbCrLf & "SKIP Flag Compressione: " & targetFile)
-                        RaiseEvent OnMessage(vbCrLf & "FS: " & New DriveInfo(Path.GetPathRoot(destPath)).DriveFormat & vbCrLf)
+                        SkippingError += 1
+                        If FullVerbose Then
+                            RaiseEvent OnMessage(vbCrLf & "SKIP Flag Compressione: " & targetFile)
+                            RaiseEvent OnMessage(vbCrLf & "FS: " & New DriveInfo(Path.GetPathRoot(destPath)).DriveFormat & vbCrLf)
+                        End If
                     End Try
                     ' Cifratura
                     Try
@@ -607,8 +643,11 @@ Public Class BackupEngine
                             BackupEngine.SetEncrypted(destPath, True)
                         End If
                     Catch ex As Exception
-                        RaiseEvent OnMessage(vbCrLf & "SKIP Flag Cifratura: " & targetFile)
-                        RaiseEvent OnMessage(vbCrLf & "FS: " & New DriveInfo(Path.GetPathRoot(destPath)).DriveFormat & vbCrLf)
+                        SkippingError += 1
+                        If FullVerbose Then
+                            RaiseEvent OnMessage(vbCrLf & "SKIP Flag Cifratura: " & targetFile)
+                            RaiseEvent OnMessage(vbCrLf & "FS: " & New DriveInfo(Path.GetPathRoot(destPath)).DriveFormat & vbCrLf)
+                        End If
                     End Try
 
 
@@ -645,23 +684,35 @@ Public Class BackupEngine
                     CopyDirectoryWithDatesSafe(dir, targetDir, totalFiles, filesCopied)
 
                 Catch ex As UnauthorizedAccessException
+                    SkippingError += 1
                     RaiseEvent OnMessage(vbCrLf & "ERRORE Accesso negato DIR: " & dir)
                 Catch ex As Exception
+                    SkippingError += 1
                     RaiseEvent OnMessage(vbCrLf & "ERRORE DIR: " & dir & " - " & ex.Message)
                 End Try
             Next
 
+            ' backup loop
+            completedSuccessfully = True
+
         Catch ex As UnauthorizedAccessException
+            SkippingError += 1
             RaiseEvent OnMessage(vbCrLf & "ERRORE Accesso negato DIR principale: " & sourceDir)
         Catch ex As Exception
+            SkippingError += 1
             RaiseEvent OnMessage(vbCrLf & "ERRORE generale: " & ex.Message)
         End Try
+
+        If Not completedSuccessfully Then
+            RaiseEvent OnMessage($"⚠ ABORTED   - SALTATI: {SkippingFile} ERRORI: {SkippingError}")
+        End If
     End Sub
 
 
     Private Async Function ExecuteWithRetry(action As Action, Optional maxRetries As Integer = 5) As Task(Of Boolean)
         Dim retryCount As Integer = 0
         Dim delaySeconds As Integer = 5 ' Aspetta 5 secondi tra i tentativi
+        SkippingError = 0
 
         While retryCount < maxRetries
             Try
@@ -677,6 +728,7 @@ Public Class BackupEngine
                 ' Opzionale: raddoppia il tempo di attesa ad ogni errore (Exponential Backoff)
                 delaySeconds *= 2
             Catch ex As Exception
+                SkippingError += 1
                 RaiseEvent OnMessage("[ERRORE FATALE] " & ex.Message)
                 Return False
             End Try
@@ -778,24 +830,34 @@ Public Class BackupEngine
         manifest.DestinationFolder = destDir
 
         Dim totalFiles As Long = 0
+        SkippingError = 0
+        SkippingFile = 0
 
         Try
             For Each file As String In Directory.EnumerateFiles(sourceDir, "*.*", SearchOption.AllDirectories)
 
                 ' Skip file temporanei, downloads parziali etc. Il tempo non aspetta :D
                 If ShouldSkipFile(file) Then
-                    RaiseEvent OnMessage("SKIP TEMP: " & file)
+                    SkippingFile += 1
+                    If FullVerbose Then
+                        If SkippingFile Mod 100 = 0 Then
+                            RaiseEvent OnMessage($"SKIP TEMP: {SkippingFile} file...")
+                        End If
+                    End If
+
                     Continue For
                 End If
 
                 Try
                     totalFiles += 1
                 Catch ex As Exception
+                    SkippingError += 1
                     Debug.WriteLine("ERRORE CONTEGGIO FILE: " & file)
                 End Try
             Next
 
         Catch ex As Exception
+            SkippingError += 1
             Debug.WriteLine("ERRORE ENUMERAZIONE: " & ex.Message)
         End Try
 
@@ -808,7 +870,13 @@ Public Class BackupEngine
 
             ' Skip file temporanei, downloads parziali etc. Il tempo non aspetta :D
             If ShouldSkipFile(file) Then
-                RaiseEvent OnMessage("SKIP TEMP: " & file)
+                SkippingFile += 1
+
+                If FullVerbose Then
+                    If SkippingFile Mod 100 = 0 Then
+                        RaiseEvent OnMessage($"SKIP TEMP: {SkippingFile} file...")
+                    End If
+                End If
                 Continue For
             End If
 
@@ -817,6 +885,7 @@ Public Class BackupEngine
                 If path.Length > 250 Then Debug.WriteLine("PATH LEN > 250: " & path.Length.ToString)
 
                 If Not System.IO.File.Exists(path) Then
+                    SkippingError += 1
                     Debug.WriteLine("NOT EXISTS: " & path)
                     Continue For
                 End If
@@ -858,6 +927,7 @@ Public Class BackupEngine
         })
 
             Catch ex As Exception
+                SkippingError += 1
                 Debug.WriteLine("ERRORE FILE: " & file)
                 Debug.WriteLine(ex.Message)
             End Try
@@ -892,6 +962,8 @@ Public Class BackupEngine
 
     Public Function CompareWithManifest(manifestPath As String, crc As CRC) As CompareResult
         Dim result As New CompareResult
+        SkippingError = 0
+        SkippingFile = 0
 
         ' Leggi JSON del manifest
         Dim json = System.IO.File.ReadAllText(manifestPath)
@@ -901,15 +973,35 @@ Public Class BackupEngine
             Dim destPath = NormalizePath(Path.Combine(manifest.DestinationFolder, file.RelativePath))
             Dim sourcePath = NormalizePath(Path.Combine(manifest.SourceFolder, file.RelativePath))
 
-            Console.WriteLine("EXPECTED: " & destPath)
-            Console.WriteLine("EXISTS: " & System.IO.File.Exists(destPath))
+            'Console.WriteLine("EXPECTED: " & destPath)
+            'Console.WriteLine("EXISTS: " & System.IO.File.Exists(destPath))
 
-            ' File mancante
-            If Not System.IO.File.Exists(destPath) OrElse Not System.IO.File.Exists(sourcePath) Then
-                Console.WriteLine("SRC: " & sourcePath)
-                Console.WriteLine("DST: " & destPath)
-                Console.WriteLine("EXISTS DST: " & System.IO.File.Exists(destPath))
+            ' File Dest mancante
+            If Not System.IO.File.Exists(destPath) Then
+                SkippingFile += 1
 
+                If FullVerbose Then
+                    If SkippingFile Mod 100 = 0 Then
+                        RaiseEvent OnMessage($"NOT EXIST DST: " & destPath)
+                    End If
+                End If
+
+                SkippingError += 1
+                result.MissingFiles.Add(file.RelativePath)
+                Continue For
+            End If
+
+            ' File Sorgente mancante
+            If Not System.IO.File.Exists(sourcePath) Then
+                SkippingFile += 1
+
+                If FullVerbose Then
+                    If SkippingFile Mod 100 = 0 Then
+                        RaiseEvent OnMessage($"NOT EXIST SRC: " & sourcePath)
+                    End If
+                End If
+
+                SkippingError += 1
                 result.MissingFiles.Add(file.RelativePath)
                 Continue For
             End If
@@ -928,6 +1020,7 @@ Public Class BackupEngine
             Dim keyDisk = CRC.BuildKey(size, lastWrite)
 
             If keyManifest <> keyDisk Then
+                SkippingError += 1
                 result.DifferentFiles.Add(file.RelativePath)
                 Continue For
             End If
@@ -944,6 +1037,8 @@ Public Class BackupEngine
             End If
         Next
 
+        RaiseEvent OnMessage(Environment.NewLine & $"SKIP: {SkippingFile}  ERRORI: {SkippingError}")
+
         Return result
     End Function
 
@@ -951,6 +1046,8 @@ Public Class BackupEngine
         ' conteggio files streaming senza ricorsione per evitare stack overflow su cartelle molto profonde
         Dim count As Integer = 0
         Dim stack As New Stack(Of String)
+        SkippingFile = 0
+        SkippingError = 0
 
         stack.Push(folder)
 
@@ -970,12 +1067,16 @@ Public Class BackupEngine
                 Next
 
             Catch ex As UnauthorizedAccessException
+                SkippingError += 1
                 RaiseEvent OnMessage("Accesso negato: " & current)
             Catch ex As Exception
+                SkippingError += 1
                 RaiseEvent OnMessage("Errore su: " & current & " - " & ex.Message)
             End Try
 
         End While
+
+        RaiseEvent OnMessage(Environment.NewLine & $"SKIP: {SkippingFile}  ERRORI: {SkippingError}")
 
         Return count
     End Function
@@ -1057,6 +1158,8 @@ Public Class BackupEngine
             Throw New Exception("Manifest non trovato")
         End If
 
+        SkippingError = 0
+
         RaiseEvent OnMessage("Inizio restore...")
 
         Dim jsonString As String = System.IO.File.ReadAllText(manifestPath)
@@ -1099,6 +1202,7 @@ Public Class BackupEngine
                     Else
                         Dim err = Marshal.GetLastWin32Error()
                         RaiseEvent OnMessage("ERR CopyFile: " & err & " -> " & destFile)
+                        SkippingError += 1
                         Threading.Thread.Sleep(50)
                     End If
                 Next
@@ -1113,12 +1217,14 @@ Public Class BackupEngine
                         End Using
                         copied = True
                     Catch ex As Exception
+                        SkippingError += 1
                         RaiseEvent OnMessage("ERR fallback: " & ex.Message & " -> " & destFile)
                     End Try
                 End If
 
                 If Not copied Then
                     failed += 1
+                    SkippingError += 1
                     RaiseEvent OnMessage("FALLITO: " & destFile)
                     GoTo ProgressStep
                 End If
@@ -1144,6 +1250,7 @@ Public Class BackupEngine
                     If sizeSrc <> sizeDst Then
                         RaiseEvent OnMessage("SIZE MISMATCH: " & destFile)
                         failed += 1
+                        SkippingError += 1
                     Else
                         RaiseEvent OnMessage("OK: " & destFile)
                     End If
@@ -1158,6 +1265,7 @@ Public Class BackupEngine
                         SetCompressed(destFile, True)
                     End If
                 Catch ex As Exception
+                    SkippingError += 1
                     RaiseEvent OnMessage("COMPRESSION ERROR: " & destFile)
                 End Try
 
@@ -1166,11 +1274,13 @@ Public Class BackupEngine
                         SetEncrypted(destFile, True)
                     End If
                 Catch ex As Exception
+                    SkippingError += 1
                     RaiseEvent OnMessage("ENCRYPTION ERROR: " & destFile)
                 End Try
 
             Catch ex As Exception
                 failed += 1
+                SkippingError += 1
                 RaiseEvent OnMessage("ERRORE: " & ex.Message)
             End Try
 
@@ -1189,7 +1299,8 @@ ProgressStep:
 
         Next
 
-        RaiseEvent OnMessage("Restore completato")
+        RaiseEvent OnMessage(Environment.NewLine & $"[RESTORE] Errori: {SkippingError}")
+        RaiseEvent OnMessage(Environment.NewLine & "Restore completato " & Now.ToString)
 
         Return failed
     End Function
@@ -1199,6 +1310,9 @@ ProgressStep:
         ' Nuovo con modalità Simulazione (Dry-Run), Overwrite, Merge etc.
         Dim json = System.IO.File.ReadAllText(manifestPath)
         Dim manifest = JsonSerializer.Deserialize(Of BackupManifest)(json)
+
+        SkippingError = 0
+        SkippingFile = 0
 
         Dim root As String = If(String.IsNullOrEmpty(restoreRoot), manifest.SourceFolder, restoreRoot)
 
@@ -1225,6 +1339,7 @@ ProgressStep:
                     If Not FileExistsSafe(targetFile) Then
                         RaiseEvent OnMessage("MISSING: " & targetFile)
                         errors += 1
+                        SkippingFile += 1
                     End If
 
                 ' Sovrascrivi
@@ -1241,6 +1356,7 @@ ProgressStep:
                             CopyFileInternal(entry, backupFile, targetFile)
                         Else
                             RaiseEvent OnMessage("SKIP: " & targetFile)
+                            SkippingFile += 1
                         End If
                     End If
 
@@ -1261,6 +1377,7 @@ ProgressStep:
 
         Next
 
+        RaiseEvent OnMessage(Environment.NewLine & $"[RESTORE] Saltati: {SkippingFile}")
         RaiseEvent OnMessage("Restore " & mode.ToString() & " completato " & Now.ToString)
 
         Return errors
@@ -1306,6 +1423,8 @@ ProgressStep:
         Dim tempFile = destFile & ".partial"
         Dim copied As Boolean = False
 
+        SkippingError = 0
+
         ' retry CopyFileW
         For i As Integer = 1 To 3
             If CopyFileWin32(sourceFile, tempFile, False) Then
@@ -1333,6 +1452,7 @@ ProgressStep:
         End If
 
         If Not copied Then
+            SkippingError += 1
             RaiseEvent OnMessage("FALLITO: " & destFile)
         End If
 
@@ -1354,6 +1474,7 @@ ProgressStep:
         Dim sizeDst = SafeGetFileSize(destFile)
 
         If sizeSrc <> sizeDst Then
+            SkippingError += 1
             RaiseEvent OnMessage("SIZE MISMATCH: " & destFile)
         Else
             RaiseEvent OnMessage("OK: " & destFile)
@@ -1367,6 +1488,7 @@ ProgressStep:
                 SetCompressed(destFile, True)
             End If
         Catch ex As Exception
+            SkippingError += 1
             RaiseEvent OnMessage("COMPRESSION ERROR: " & destFile)
         End Try
 
@@ -1375,6 +1497,7 @@ ProgressStep:
                 SetEncrypted(destFile, True)
             End If
         Catch ex As Exception
+            SkippingError += 1
             RaiseEvent OnMessage("ENCRYPTION ERROR: " & destFile)
         End Try
     End Sub
