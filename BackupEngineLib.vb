@@ -1,4 +1,5 @@
 ﻿Imports System.IO
+Imports System.IO.Ports
 Imports System.Net.WebRequestMethods
 Imports System.Runtime.InteropServices
 Imports System.Text.Json
@@ -23,6 +24,10 @@ Public Class BackupEngine
 
     ' Full Verbose
     Public Property FullVerbose As Boolean = False
+
+    ' Stop Sicuro
+    Public Property SecurityStop As Integer = 0
+    Public Property SecurityStopFolder As String = ""
 
     ' notifica alla form
     Public Event OnYieldRequired()
@@ -165,6 +170,18 @@ Public Class BackupEngine
 
         For Each file As String In Directory.EnumerateFiles(sourceDir, "*.*", SearchOption.AllDirectories)
 
+            ' STOP Veloce ogni 1000 file
+            If filesCopied Mod 1000 = 0 Then
+                ' Stop Sicuro
+                If System.IO.File.Exists(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) Then
+                    ' Se leggo il codice impostato dall'app, devo terminare brutalmente
+                    If System.IO.File.ReadAllText(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) = "STOP=" & SecurityStop.ToString Then
+                        RaiseEvent OnMessage(String.Format(Environment.NewLine & "STOPPING >>>> {0} / {1}" & vbCrLf, filesCopied, totalFiles))
+                        Exit Sub
+                    End If
+                End If
+            End If
+
             ' Controllo file esistenza (NO long path qui)
             Dim sourcePath As String = Path.GetFullPath(file)
             Dim normalizedSource As String = NormalizePath(Path.GetFullPath(sourcePath))
@@ -235,6 +252,14 @@ Public Class BackupEngine
             End If
             ' Stampa ogni 1000 file
             If filesCopied Mod 1500 = 0 OrElse filesCopied = totalFiles Then
+                ' Stop Sicuro
+                If System.IO.File.Exists(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) Then
+                    ' Se leggo il codice impostato dall'app, devo terminare brutalmente
+                    If System.IO.File.ReadAllText(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) = "STOP=" & SecurityStop.ToString Then
+                        Exit Sub
+                    End If
+                End If
+
                 Dim percent As Double = (filesCopied / totalFiles) * 100
                 RaiseEvent OnMessage(String.Format(Environment.NewLine & "[DRY] COPYING >>>> {0} / {1} ({2:0.00}%)" & vbCrLf, filesCopied, totalFiles, percent))
             End If
@@ -351,6 +376,19 @@ Public Class BackupEngine
                     End If
 
                     Continue For
+                End If
+
+
+                ' STOP Veloce ogni 1000 file
+                If filesCopied Mod 1000 = 0 Then
+                    ' Stop Sicuro
+                    If System.IO.File.Exists(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) Then
+                        ' Se leggo il codice impostato dall'app, devo terminare brutalmente
+                        If System.IO.File.ReadAllText(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) = "STOP=" & SecurityStop.ToString Then
+                            RaiseEvent OnMessage(String.Format(Environment.NewLine & "STOPPING >>>> {0} / {1}" & vbCrLf, filesCopied, totalFiles))
+                            Exit Sub
+                        End If
+                    End If
                 End If
 
                 Try
@@ -868,6 +906,18 @@ Public Class BackupEngine
 
         For Each file In Directory.EnumerateFiles(sourceDir, "*.*", SearchOption.AllDirectories)
 
+            ' STOP Veloce ogni 1000 file
+            If runningTotalFiles Mod 1000 = 0 Then
+                ' Stop Sicuro
+                If System.IO.File.Exists(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) Then
+                    ' Se leggo il codice impostato dall'app, devo terminare brutalmente
+                    If System.IO.File.ReadAllText(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) = "STOP=" & SecurityStop.ToString Then
+                        RaiseEvent OnMessage(String.Format(Environment.NewLine & "STOPPING >>>> {0} / {1}" & vbCrLf, runningTotalFiles, totalFiles))
+                        Exit Sub
+                    End If
+                End If
+            End If
+
             ' Skip file temporanei, downloads parziali etc. Il tempo non aspetta :D
             If ShouldSkipFile(file) Then
                 SkippingFile += 1
@@ -968,8 +1018,22 @@ Public Class BackupEngine
         ' Leggi JSON del manifest
         Dim json = System.IO.File.ReadAllText(manifestPath)
         Dim manifest = JsonSerializer.Deserialize(Of BackupManifest)(json)
+        Dim runningTotalFiles As Long = 0
 
         For Each file In manifest.FileList
+
+            ' STOP Veloce ogni 1000 file
+            If runningTotalFiles Mod 1000 = 0 Then
+                ' Stop Sicuro
+                If System.IO.File.Exists(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) Then
+                    ' Se leggo il codice impostato dall'app, devo terminare brutalmente
+                    If System.IO.File.ReadAllText(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) = "STOP=" & SecurityStop.ToString Then
+                        RaiseEvent OnMessage(String.Format(Environment.NewLine & "STOPPING >>>> {0} / {1}" & vbCrLf, runningTotalFiles, manifest.TotalFiles))
+                        Exit Function
+                    End If
+                End If
+            End If
+
             Dim destPath = NormalizePath(Path.Combine(manifest.DestinationFolder, file.RelativePath))
             Dim sourcePath = NormalizePath(Path.Combine(manifest.SourceFolder, file.RelativePath))
 
@@ -1035,6 +1099,9 @@ Public Class BackupEngine
             Else
                 result.DifferentFiles.Add(file.RelativePath)
             End If
+
+            ' Progresso
+            runningTotalFiles += 1
         Next
 
         RaiseEvent OnMessage(Environment.NewLine & $"SKIP: {SkippingFile}  ERRORI: {SkippingError}")
@@ -1181,6 +1248,20 @@ Public Class BackupEngine
         For Each entry In manifest.FileList
 
             Try
+
+                ' STOP Veloce ogni 1000 file
+                If processed Mod 1000 = 0 Then
+                    ' Stop Sicuro
+                    If System.IO.File.Exists(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) Then
+                        ' Se leggo il codice impostato dall'app, devo terminare brutalmente
+                        If System.IO.File.ReadAllText(System.IO.Path.Combine(SecurityStopFolder, "STOPP.safe")) = "STOP=" & SecurityStop.ToString Then
+                            RaiseEvent OnMessage(String.Format(Environment.NewLine & "STOPPING >>>> {0} / {1}" & vbCrLf, processed, totalFiles))
+                            Exit Function
+                        End If
+                    End If
+                End If
+
+
                 Dim sourceFile = NormalizePath(Path.Combine(manifest.DestinationFolder, entry.RelativePath))
                 Dim destFile = NormalizePath(Path.Combine(targetRoot, entry.RelativePath))
 
