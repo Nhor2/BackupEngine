@@ -2,6 +2,7 @@
 Imports System.IO.Ports
 Imports System.Net.WebRequestMethods
 Imports System.Runtime.InteropServices
+Imports System.Text
 Imports System.Text.Json
 Imports Microsoft.Win32.SafeHandles
 
@@ -267,49 +268,295 @@ Public Class BackupEngine
     End Sub
 
 
-    Public Function SafeCopy(source As String, dest As String, Optional logging As Boolean = False) As Boolean
-        ' Semplice copia con Fallback per evitare problemi di file lock o accesso negato, soprattutto su file in uso
+    Public Function SafeCopy(source As String, dest As String, Optional overwrite As Boolean = False, Optional logging As Boolean = False) As Boolean
+        ' Semplice copia con Fallback per evitare problemi di file lock o accesso negato, soprattutto su file in uso. Con overwrite = True sovrascrive.
         Dim returned As Boolean = False
         Dim copied As Boolean = False
+        Dim fileExist As Boolean = False
         SkippingError = 0
 
-        For i = 1 To 3
-            Try
-                'OK
-                System.IO.File.Copy(source, dest, True)
-                If logging OrElse FullVerbose Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
-                returned = True
-                copied = True
-            Catch
-                ' Riprovo
-                System.Threading.Thread.Sleep(200)
-            End Try
-        Next
-
-        ' 🔁 FALLBACK SICURO
-        If copied Then Return True
-
+        ' =========================
+        ' SIZE SICURO
+        ' =========================
+        Dim size As Long = 0
         Try
-            Dim tempDest = dest & ".tmp"
+            size = SafeGetFileSize(source)
+            If size = 0 Then
+                RaiseEvent OnMessage(vbCrLf & "[ZERO] byte (" & size.ToString() & ") per " & source)
+                ' Il File esiste
+                fileExist = True
+            ElseIf size > 0 Then
+                ' Il File esiste
+                fileExist = True
+            End If
+        Catch
+            If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[ERROR] Size: " & source)
+        End Try
 
-            Using sourceStream As New FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read)
-                Using destStream As New FileStream(tempDest, FileMode.Create, FileAccess.Write, FileShare.None)
-                    sourceStream.CopyTo(destStream)
-                End Using
-            End Using
 
-            ' Sostituzione atomica
-            If System.IO.File.Exists(dest) Then System.IO.File.Delete(dest)
-            System.IO.File.Move(tempDest, dest)
-            If logging OrElse FullVerbose Then RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+        If fileExist Then
+            ' Il file esiste e lo sovrascriviamo
+            If overwrite Then
+                ' =========================
+                ' RETRY COPYFILEW - RESILIENT VERSION
+                ' =========================
+                Dim maxRetries As Integer = 10 ' Almeno 10 tentativi per la rete
+                Dim retryDelay As Integer = 2000 ' 2 secondi tra i tentativi (dà tempo alla rete di riprendersi)
+
+                For i As Integer = 1 To maxRetries
+                    If BackupEngine.CopyFileWin32(source, dest, False) Then
+                        RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+                        copied = True
+                        Exit For
+                    Else
+
+                        Dim err = Marshal.GetLastWin32Error()
+
+                        ' 53: Network path not found
+                        ' 64: Network name is no longer available
+                        ' 121: Semaphore timeout period has expired (tipico dei grossi file su WiFi instabile)
+                        ' 5: Access Denied (magari Samba si è riavviato e sta rinegoziando i permessi)
+
+                        If FullVerbose Then RaiseEvent OnMessage($"[TENTATIVO {i}] Errore API {err} su: {Path.GetFileName(source)}")
+
+                        If i < maxRetries Then
+                            ' Se è un errore di rete, forse è meglio aspettare un po' di più
+                            If err = 64 Or err = 53 Or err = 121 Then
+                                If FullVerbose Then RaiseEvent OnMessage("Rete instabile, attesa riconnessione...")
+
+                                ' Notifica alla Form che deve processare i messaggi
+                                RaiseEvent OnYieldRequired()
+
+                                Threading.Thread.Sleep(5000) ' Aspetta 5 secondi se la rete è proprio giù
+                            Else
+                                Threading.Thread.Sleep(retryDelay) ' Aspetta 2 secondi per errori generici
+                            End If
+                        Else
+                            SkippingError += 1
+                            RaiseEvent OnMessage("[ERRORE] Copia in " & maxRetries & " tentativi.")
+                            copied = False
+
+                        End If
+                    End If
+                Next
+
+                ' Siamo usciti dal FOR perchè copiato?
+                If Not copied Then
+                    ' 🔁 FALLBACK FILESTREAM
+                    Try
+                        Dim tempDest = dest & ".tmp"
+
+                        Using sourceStream As New FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite Or FileShare.Delete)
+                            Using destStream As New FileStream(tempDest, FileMode.Create, FileAccess.Write, FileShare.None)
+                                sourceStream.CopyTo(destStream)
+                            End Using
+                        End Using
+
+                        ' Sostituzione atomica
+                        If System.IO.File.Exists(dest) Then System.IO.File.Delete(dest)
+                        System.IO.File.Move(tempDest, dest)
+                        RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+
+                        copied = True
+
+                    Catch
+                        SkippingError += 1
+                        RaiseEvent OnMessage(vbCrLf & $"[ERROR] File non copiato: {source}")
+                        returned = False
+
+                        Return returned
+                    End Try
+                End If
+
+            Else
+                ' Non Sovrascrivere la destinazione
+                Dim sizeDest As Long = 0
+                Try
+                    sizeDest = SafeGetFileSize(dest)
+                    If sizeDest >= 0 AndAlso System.IO.File.Exists(dest) Then
+                        ' Destinazione è zero byte, ma non sovrascrivere comunque
+                        copied = False
+                        returned = False
+
+                        Return returned
+                    Else
+                        ' Puoi copiare...
+
+                        ' =========================
+                        ' RETRY COPYFILEW - RESILIENT VERSION
+                        ' =========================
+                        Dim maxRetries As Integer = 10 ' Almeno 10 tentativi per la rete
+                        Dim retryDelay As Integer = 2000 ' 2 secondi tra i tentativi (dà tempo alla rete di riprendersi)
+
+                        For i As Integer = 1 To maxRetries
+                            If BackupEngine.CopyFileWin32(source, dest, Not overwrite) Then
+                                RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+                                copied = True
+                                Exit For
+                            Else
+                                Dim err = Marshal.GetLastWin32Error()
+
+                                ' 53: Network path not found
+                                ' 64: Network name is no longer available
+                                ' 121: Semaphore timeout period has expired (tipico dei grossi file su WiFi instabile)
+                                ' 5: Access Denied (magari Samba si è riavviato e sta rinegoziando i permessi)
+
+                                If FullVerbose Then RaiseEvent OnMessage($"[TENTATIVO {i}] Errore API {err} su: {Path.GetFileName(source)}")
+
+                                If i < maxRetries Then
+                                    ' Se è un errore di rete, forse è meglio aspettare un po' di più
+                                    If err = 64 Or err = 53 Or err = 121 Then
+                                        If FullVerbose Then RaiseEvent OnMessage("Rete instabile, attesa riconnessione...")
+
+                                        ' Notifica alla Form che deve processare i messaggi
+                                        RaiseEvent OnYieldRequired()
+
+                                        Threading.Thread.Sleep(5000) ' Aspetta 5 secondi se la rete è proprio giù
+                                    Else
+                                        Threading.Thread.Sleep(retryDelay) ' Aspetta 2 secondi per errori generici
+                                    End If
+                                Else
+                                    SkippingError += 1
+                                    RaiseEvent OnMessage("[ERRORE] Copia in " & maxRetries & " tentativi.")
+                                    copied = False
+
+                                End If
+                            End If
+                        Next
+
+                        ' Siamo usciti dal FOR perchè copiato?
+                        If Not copied Then
+                            ' 🔁 FALLBACK FILESTREAM
+                            Try
+                                Dim tempDest = dest & ".tmp"
+
+                                Using sourceStream As New FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite Or FileShare.Delete)
+                                    Using destStream As New FileStream(tempDest, FileMode.Create, FileAccess.Write, FileShare.None)
+                                        sourceStream.CopyTo(destStream)
+                                    End Using
+                                End Using
+
+                                ' Sostituzione atomica
+                                If System.IO.File.Exists(dest) Then System.IO.File.Delete(dest)
+                                System.IO.File.Move(tempDest, dest)
+                                RaiseEvent OnMessage(vbCrLf & $"[COPY] OK: {source}")
+
+                                copied = True
+
+                            Catch
+                                SkippingError += 1
+                                RaiseEvent OnMessage(vbCrLf & $"[ERROR] File non copiato: {source}")
+                                returned = False
+
+                                Return returned
+                            End Try
+                        End If
+
+                    End If
+                Catch
+                    If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[ERROR] Size: " & source)
+                End Try
+
+            End If
+
+        Else
+            RaiseEvent OnMessage(vbCrLf & $"[ERROR] File non esiste?! {source}")
+            copied = False
+            returned = False
+        End If
+
+
+        ' 🔁 FALLBACK SICURO su copied per Attributi
+        If copied Then
+
+            ' =========================
+            ' ATTRIBUTI ORIGINE
+            ' =========================
+            Dim attrs As FileAttributes = FileAttributes.Normal
+
+            Try
+                attrs = System.IO.File.GetAttributes(source)
+            Catch
+                SkippingError += 1
+                RaiseEvent OnMessage(vbCrLf & "[ERROR] Attributi: " & source)
+            End Try
+
+            ' Se ReadOnly → rimuovilo temporaneamente
+            If (attrs And FileAttributes.ReadOnly) = FileAttributes.ReadOnly Then
+                System.IO.File.SetAttributes(dest, attrs And Not FileAttributes.ReadOnly)
+            End If
+
+            ' =========================
+            ' RIMUOVE ZONE IDENTIFIER
+            ' =========================
+            Dim zoneIdentifier As String = dest & ":Zone.Identifier"
+            Try
+                If System.IO.File.Exists(zoneIdentifier) Then
+                    System.IO.File.Delete(zoneIdentifier)
+                End If
+            Catch
+                SkippingError += 1
+                RaiseEvent OnMessage(vbCrLf & "[ERROR] Impossibile rimuovere Zone.Identifier: " & dest)
+            End Try
+
+            ' =========================
+            ' DATE
+            ' =========================
+            Try
+                System.IO.File.SetCreationTime(dest, System.IO.File.GetCreationTime(source))
+                System.IO.File.SetLastWriteTime(dest, System.IO.File.GetLastWriteTime(source))
+                System.IO.File.SetLastAccessTime(dest, System.IO.File.GetLastAccessTime(source))
+            Catch
+                SkippingError += 1
+                RaiseEvent OnMessage(vbCrLf & "[ERROR] Date: " & dest)
+            End Try
+
+            ' =========================
+            ' RIPRISTINO ATTRIBUTI
+            ' =========================
+            Try
+                System.IO.File.SetAttributes(dest, attrs)
+            Catch
+                SkippingError += 1
+                RaiseEvent OnMessage(vbCrLf & "[ERROR] Set attributi: " & source)
+            End Try
+
+            ' =========================
+            ' COMPRESSIONE / CIFRATURA
+            ' =========================
+            Dim attrsExtended As FileAttributes = 0
+            Try
+                attrsExtended = System.IO.File.GetAttributes(source)
+            Catch
+                attrsExtended = 0
+            End Try
+            ' Compressione
+            Try
+                If IsNtfs(dest) AndAlso (attrsExtended And FileAttributes.Compressed) <> 0 Then
+                    BackupEngine.SetCompressed(dest, True)
+                End If
+            Catch ex As Exception
+                SkippingError += 1
+                If FullVerbose Then
+                    RaiseEvent OnMessage(vbCrLf & "SKIP Flag Compressione: " & source)
+                    RaiseEvent OnMessage(vbCrLf & "FS: " & New DriveInfo(Path.GetPathRoot(dest)).DriveFormat & vbCrLf)
+                End If
+            End Try
+            ' Cifratura
+            Try
+                If IsNtfs(dest) AndAlso (attrsExtended And FileAttributes.Encrypted) <> 0 Then
+                    BackupEngine.SetEncrypted(dest, True)
+                End If
+            Catch ex As Exception
+                SkippingError += 1
+                If FullVerbose Then
+                    RaiseEvent OnMessage(vbCrLf & "SKIP Flag Cifratura: " & source)
+                    RaiseEvent OnMessage(vbCrLf & "FS: " & New DriveInfo(Path.GetPathRoot(dest)).DriveFormat & vbCrLf)
+                End If
+            End Try
 
             returned = True
-
-        Catch
-            SkippingError += 1
-            RaiseEvent OnMessage(vbCrLf & $"[ERROR] File non copiato: {source}")
-            returned = False
-        End Try
+        End If
 
         Return returned
     End Function
@@ -481,10 +728,10 @@ Public Class BackupEngine
                     Try
                         size = SafeGetFileSize(sourcePath)
                         If size = 0 Then
-                            RaiseEvent OnMessage(vbCrLf & "ZERO byte [" & size.ToString() & "] per " & file)
+                            RaiseEvent OnMessage(vbCrLf & "[ZERO] byte (" & size.ToString() & ") per " & file)
                         End If
                     Catch
-                        If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "Errore Size: " & file)
+                        If FullVerbose Then RaiseEvent OnMessage(vbCrLf & "[ERROR] Size: " & file)
                     End Try
 
                     ' Debug path lunghi
@@ -541,7 +788,7 @@ Public Class BackupEngine
                                 End If
                             Else
                                 SkippingError += 1
-                                RaiseEvent OnMessage("ERRORE DEFINITIVO dopo " & maxRetries & " tentativi.")
+                                RaiseEvent OnMessage("[ERROR] File dopo " & maxRetries & " tentativi.")
                             End If
                         End If
                     Next
@@ -560,10 +807,10 @@ Public Class BackupEngine
                                 End Using
                             End Using
                             copied = True
-                            RaiseEvent OnMessage(vbCrLf & "COPY FALLBACK FileStream OK -> " & file)
+                            RaiseEvent OnMessage(vbCrLf & "[COPY] FALLBACK OK -> " & file)
                         Catch ex As Exception
                             SkippingError += 1
-                            RaiseEvent OnMessage(vbCrLf & "ERRORE FALLBACK FileStream: " & ex.Message & " -> " & file)
+                            RaiseEvent OnMessage(vbCrLf & "[ERROR] FALLBACK: " & ex.Message & " -> " & file)
                         End Try
                     End If
 
@@ -587,7 +834,7 @@ Public Class BackupEngine
                             If FullVerbose Then RaiseEvent OnMessage("COPIED -> " & normalizedDest)
                         Catch ex As Exception
                             SkippingError += 1
-                            RaiseEvent OnMessage("ERRORE RENAME: " & ex.Message & " -> " & file)
+                            RaiseEvent OnMessage("[ERROR] RENAME: " & ex.Message & " -> " & file)
                             copied = False
                         End Try
                     End If
@@ -597,20 +844,20 @@ Public Class BackupEngine
                     ' =========================
                     If Not copied Then
                         SkippingError += 1
-                        RaiseEvent OnMessage(vbCrLf & "ERRORE COPIA DEFINITIVO: " & file)
+                        RaiseEvent OnMessage(vbCrLf & "[ERROR] COPIA DEFINITIVO: " & file)
                         Continue For
                     End If
 
                     ' =========================
                     ' ATTRIBUTI ORIGINE
                     ' =========================
-                    Dim attrs As FileAttributes
+                    Dim attrs As FileAttributes = FileAttributes.Normal
 
                     Try
                         attrs = System.IO.File.GetAttributes(sourcePath)
                     Catch
                         SkippingError += 1
-                        RaiseEvent OnMessage(vbCrLf & "ERRORE attributi: " & file)
+                        RaiseEvent OnMessage(vbCrLf & "[ERROR] Attributi: " & file)
                         Continue For
                     End Try
 
@@ -629,7 +876,7 @@ Public Class BackupEngine
                         End If
                     Catch
                         SkippingError += 1
-                        RaiseEvent OnMessage(vbCrLf & "ERRORE Impossibile rimuovere Zone.Identifier: " & targetFile)
+                        RaiseEvent OnMessage(vbCrLf & "[ERROR] Impossibile rimuovere Zone.Identifier: " & targetFile)
                     End Try
 
                     ' =========================
@@ -641,7 +888,7 @@ Public Class BackupEngine
                         System.IO.File.SetLastAccessTime(destPath, System.IO.File.GetLastAccessTime(normalizedSource))
                     Catch
                         SkippingError += 1
-                        RaiseEvent OnMessage(vbCrLf & "ERRORE date: " & targetFile)
+                        RaiseEvent OnMessage(vbCrLf & "[ERROR] Date: " & targetFile)
                     End Try
 
                     ' =========================
@@ -651,7 +898,7 @@ Public Class BackupEngine
                         System.IO.File.SetAttributes(destPath, attrs)
                     Catch
                         SkippingError += 1
-                        RaiseEvent OnMessage(vbCrLf & "ERRORE set attributi: " & targetFile)
+                        RaiseEvent OnMessage(vbCrLf & "[ERROR] Set attributi: " & targetFile)
                     End Try
 
                     ' =========================
@@ -705,9 +952,9 @@ Public Class BackupEngine
                     End If
 
                 Catch ex As UnauthorizedAccessException
-                    RaiseEvent OnMessage(vbCrLf & "ERRORE Accesso negato FILE: " & file)
+                    RaiseEvent OnMessage(vbCrLf & "[ERROR] Accesso negato FILE: " & file)
                 Catch ex As Exception
-                    RaiseEvent OnMessage(vbCrLf & "ERRORE FILE: " & file & " - " & ex.Message)
+                    RaiseEvent OnMessage(vbCrLf & "[ERROR] FILE: " & file & " - " & ex.Message)
                 End Try
             Next
 
@@ -723,10 +970,10 @@ Public Class BackupEngine
 
                 Catch ex As UnauthorizedAccessException
                     SkippingError += 1
-                    RaiseEvent OnMessage(vbCrLf & "ERRORE Accesso negato DIR: " & dir)
+                    RaiseEvent OnMessage(vbCrLf & "[ERROR] Accesso negato DIR: " & dir)
                 Catch ex As Exception
                     SkippingError += 1
-                    RaiseEvent OnMessage(vbCrLf & "ERRORE DIR: " & dir & " - " & ex.Message)
+                    RaiseEvent OnMessage(vbCrLf & "[ERROR] DIR: " & dir & " - " & ex.Message)
                 End Try
             Next
 
@@ -735,10 +982,10 @@ Public Class BackupEngine
 
         Catch ex As UnauthorizedAccessException
             SkippingError += 1
-            RaiseEvent OnMessage(vbCrLf & "ERRORE Accesso negato DIR principale: " & sourceDir)
+            RaiseEvent OnMessage(vbCrLf & "[ERROR] Accesso negato DIR principale: " & sourceDir)
         Catch ex As Exception
             SkippingError += 1
-            RaiseEvent OnMessage(vbCrLf & "ERRORE generale: " & ex.Message)
+            RaiseEvent OnMessage(vbCrLf & "[ERROR] generale: " & ex.Message)
         End Try
 
         If Not completedSuccessfully Then
