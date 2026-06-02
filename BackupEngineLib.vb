@@ -1042,23 +1042,26 @@ Public Class BackupEngine
 
 
     Private Function GetRelativePath(basePath As String, fullPath As String) As String
-        Dim baseFull = Path.GetFullPath(basePath).TrimEnd("\"c) & "\"
+
+        Dim baseFull = Path.GetFullPath(basePath).TrimEnd("\"c)
         Dim fullFull = Path.GetFullPath(fullPath)
 
-        ' 🔥 rimuove eventuale prefisso \\?\
-        If baseFull.StartsWith("\\?\") Then baseFull = baseFull.Substring(4)
-        If fullFull.StartsWith("\\?\") Then fullFull = fullFull.Substring(4)
+        ' Normalizza SOLO per confronto logico (non per storage)
+        baseFull = baseFull.Replace("\\?\UNC\", "\\")
+        baseFull = baseFull.Replace("\\?\", "")
 
-        If fullFull.StartsWith(baseFull, StringComparison.OrdinalIgnoreCase) Then
+        fullFull = fullFull.Replace("\\?\UNC\", "\\")
+        fullFull = fullFull.Replace("\\?\", "")
 
-            Dim rel = fullFull.Substring(baseFull.Length)
-
-            ' 🔥 normalizzazione finale
-            Return rel.Replace("/"c, "\"c).ToLowerInvariant()
-
+        If Not fullFull.StartsWith(baseFull & "\", StringComparison.OrdinalIgnoreCase) Then
+            Throw New Exception("Path non sotto base: " & fullFull)
         End If
 
-        Throw New Exception("Path non sotto base: " & fullFull)
+        Dim rel = fullFull.Substring(baseFull.Length + 1)
+
+        ' IMPORTANTE: NON forzare lowercase
+        Return rel.Replace("/"c, "\"c)
+
     End Function
 
 
@@ -1187,7 +1190,7 @@ Public Class BackupEngine
             End If
 
             Try
-                Dim path = NormalizePath(file)
+                Dim path = file
                 If path.Length > 250 Then Debug.WriteLine("PATH LEN > 250: " & path.Length.ToString)
 
                 If Not System.IO.File.Exists(path) Then

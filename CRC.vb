@@ -8,13 +8,25 @@ Public Class CRC
     ' ===================== CORE =====================
 
     Private Shared Function NormalizePath(path As String) As String
+
+        If String.IsNullOrWhiteSpace(path) Then
+            Return path
+        End If
+
         Dim fullPath = System.IO.Path.GetFullPath(path)
 
+        ' UNC path
+        If fullPath.StartsWith("\\") Then
+            Return "\\?\UNC\" & fullPath.Substring(2)
+        End If
+
+        ' Local path
         If Not fullPath.StartsWith("\\?\") Then
-            fullPath = "\\?\" & fullPath
+            Return "\\?\" & fullPath
         End If
 
         Return fullPath
+
     End Function
 
     Public Shared Function ComputeFullHash(path As String) As String
